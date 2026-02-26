@@ -1,0 +1,97 @@
+import socket
+import struct
+import csv
+import signal
+import time
+
+LOCAL_PORT = 5006
+ESP_PORT   = 5005
+ESP_IP     = "10.126.94.172"   # ← همین IP که ESP داد
+
+BATCH_SIZE = 10  # برای تست: با ESP هم‌خوانی کن – 5, 8 یا 10
+
+# فرمت تک پکت
+PACKET_FORMAT = "<BBB4h3hB"
+SINGLE_PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
+BATCH_PACKET_SIZE = SINGLE_PACKET_SIZE * BATCH_SIZE
+
+running = True
+
+recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+recv_sock.bind(("", LOCAL_PORT))
+recv_sock.settimeout(0.5)
+
+send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def send_cmd(cmd: bytes):
+    send_sock.sendto(cmd, (ESP_IP, ESP_PORT))
+
+def signal_handler(sig, frame):
+    global running
+    running = False
+
+signal.signal(signal.SIGINT, signal_handler)
+
+csv_file = open("eeg_imu_data.csv", "w", newline="")
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(["counter", "EEG1", "EEG2", "EEG3", "EEG4",
+                     "IMU_X", "IMU_Y", "IMU_Z"])
+
+print("Packet size:", BATCH_PACKET_SIZE)
+
+time.sleep(1)
+send_cmd(b"START")
+print("START sent")
+
+last_counter = -1
+row_buffer = []  # برای batch write به CSV و سرعت بیشتر
+
+while running:
+    try:
+        data, addr = recv_sock.recvfrom(1024 * BATCH_SIZE)  # buffer بزرگ‌تر
+
+        if len(data) != BATCH_PACKET_SIZE:
+            print("Wrong size:", len(data))
+            continue
+
+        for i in range(BATCH_SIZE):
+            offset = i * SINGLE_PACKET_SIZE
+            unpacked = struct.unpack(PACKET_FORMAT, data[offset:offset + SINGLE_PACKET_SIZE])
+
+            header = unpacked[0]
+            packetType = unpacked[1]
+            counter = unpacked[2]
+            eeg = unpacked[3:7]
+            imu = unpacked[7:10]
+            footer = unpacked[10]
+
+            if header != 0xAA or footer != 0x55:
+                print("Corrupted packet")
+                continue
+
+            # چک دراپ پکت
+            if last_counter != -1:
+                if (counter - last_counter) % 256 != 1:
+                    print("Packet loss detected")
+
+            last_counter = counter
+
+            row_buffer.append([counter, *eeg, *imu])
+
+            # هر 100 ردیف write کن برای سرعت
+            if len(row_buffer) >= 100:
+                csv_writer.writerows(row_buffer)
+                row_buffer = []
+
+    except socket.timeout:
+        continue
+
+# write باقی‌مانده
+if row_buffer:
+    csv_writer.writerows(row_buffer)
+
+send_cmd(b"STOP")
+csv_file.close()
+recv_sock.close()
+send_sock.close()
+print("Stopped cleanly")
