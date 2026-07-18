@@ -1,70 +1,94 @@
-#include <WiFi.h>
-#include <WiFiUdp.h>
+/*
+ * EEG BLE Firmware 
+ * 
+ */
+
+#include <NimBLEDevice.h>
 #include <Wire.h>
-#include <esp_wifi.h>  
 
-// WiFi 
-const char* ssid = "Nothing";
-const char* password = "123456780";
+// ─── BLE identifiers ─────────────────────────────────────────────────────────
+static const char* BLE_DEVICE_NAME = "EEG_Sensor";
+static const char* SERVICE_UUID    = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char* DATA_UUID       = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+static const char* CMD_UUID        = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 
-WiFiUDP udp;
-unsigned int localPort = 5005;
-IPAddress pythonIP;
-unsigned int pythonPort;
-volatile bool isRunning = false; 
+static const uint16_t REQUESTED_MTU = 185;
 
-// I2C 
+// ─── I2C pins ────────────────────────────────────────────────────────────────
 #define I2C_ADS_SDA 21
 #define I2C_ADS_SCL 22
-
 #define I2C_IMU_SDA 18
 #define I2C_IMU_SCL 19
 
-TwoWire I2C_ADS = TwoWire(0);
-TwoWire I2C_IMU = TwoWire(1);
+static TwoWire I2C_ADS = TwoWire(0);
+static TwoWire I2C_IMU = TwoWire(1);
 
-// Addresses 
-const uint8_t ADS1_ADDR = 0x48;
-const uint8_t ADS2_ADDR = 0x49;
-const uint8_t IMU_ADDR  = 0x53;
+// ─── I2C addresses ───────────────────────────────────────────────────────────
+static const uint8_t ADS1_ADDR = 0x48;
+static const uint8_t ADS2_ADDR = 0x49;
+static const uint8_t IMU_ADDR  = 0x53;
 
-// ADS Gain
-uint16_t ADS_GAIN = 0x0800; 
-// گین 16 برای +/- 0.256V 0x0A00
+// ─── ADS1115 config ──────────────────────────────────────────────────────────
+uint16_t ADS_GAIN = 0x0800;
+const uint16_t BASE_CONFIG_0_1 = 0x81F3;
+const uint16_t BASE_CONFIG_2_3 = 0xB1F3;
 
-// BASE_CONFIG برای single-shot, DR=111 برای 860 SPS واقعی
-const uint16_t BASE_CONFIG_0_1 = 0x81F3;  
-const uint16_t BASE_CONFIG_2_3 = 0xB1F3;  
+// ─── Batch / packet ──────────────────────────────────────────────────────────
+const int BATCH_SIZE = 10;
 
-// Batch 
-const int BATCH_SIZE = 20;  
-
-// Packet 
 #pragma pack(push, 1)
 struct SensorDataPacket {
-  uint8_t header = 0xAA;
-  uint8_t packetType = 0x01;
-  uint8_t counter;
-  int16_t eeg1;
-  int16_t eeg2;
-  int16_t eeg3;
-  int16_t eeg4;
-  int16_t accelX;
-  int16_t accelY;
-  int16_t accelZ;
-  uint8_t footer = 0x55;
+  uint8_t  header     = 0xAA;
+  uint8_t  packetType = 0x01;
+  uint8_t  counter;
+  int16_t  eeg1;
+  int16_t  eeg2;
+  int16_t  eeg3;
+  int16_t  eeg4;
+  int16_t  accelX;
+  int16_t  accelY;
+  int16_t  accelZ;
+  uint8_t  footer     = 0x55;
 };
 #pragma pack(pop)
 
-SensorDataPacket buffer[BATCH_SIZE];
+static_assert(sizeof(SensorDataPacket) == 18, "Size mismatch");
+
+SensorDataPacket sampleBuffer[BATCH_SIZE];
 uint8_t packetCounter = 0;
 int batchIndex = 0;
 
-// Queue برای FreeRTOS
-QueueHandle_t dataQueue;
+// ─── Runtime state ────────────────────────────────────────────────────────────
+static volatile bool deviceConnected = false;
+static volatile bool notifyEnabled   = false;
+static volatile bool isRunning       = false;
 
-inline void writeRegister(uint8_t addr, uint8_t reg, uint16_t value) __attribute__((always_inline));
-inline void writeRegister(uint8_t addr, uint8_t reg, uint16_t value) {
+// ─── BLE objects ─────────────────────────────────────────────────────────────
+static NimBLEServer*         pServer   = nullptr;
+static NimBLECharacteristic* pDataChar = nullptr;
+static NimBLECharacteristic* pCmdChar  = nullptr;
+
+// ─── FreeRTOS queue ──────────────────────────────────────────────────────────
+static QueueHandle_t dataQueue = nullptr;
+
+// ─── Rate-monitor ─────────────────────────────────────────────────────────────
+static uint32_t      rateCount   = 0;
+static unsigned long rateTotalUs = 0;
+static unsigned long rateLastMs  = 0;
+
+// ─── Statistics ──────────────────────────────────────────────────────────────
+static uint32_t totalSamples = 0;
+static uint32_t droppedBatches = 0;
+static unsigned long lastAdvertisingTime = 0;
+
+// ─── Advertising timer ──────────────────────────────────────────────────────
+static const unsigned long ADVERTISING_RESTART_INTERVAL = 30000; // 30 seconds
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  I2C inline helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static inline void writeADS(uint8_t addr, uint8_t reg, uint16_t value) {
   I2C_ADS.beginTransmission(addr);
   I2C_ADS.write(reg);
   I2C_ADS.write((uint8_t)(value >> 8));
@@ -72,177 +96,316 @@ inline void writeRegister(uint8_t addr, uint8_t reg, uint16_t value) {
   I2C_ADS.endTransmission();
 }
 
-inline int16_t readRegister(uint8_t addr, uint8_t reg) __attribute__((always_inline));
-inline int16_t readRegister(uint8_t addr, uint8_t reg) {
+static inline int16_t readADS(uint8_t addr) {
   I2C_ADS.beginTransmission(addr);
-  I2C_ADS.write(reg);
+  I2C_ADS.write(0x00);
   I2C_ADS.endTransmission();
   I2C_ADS.requestFrom(addr, (uint8_t)2);
-  return (I2C_ADS.read() << 8) | I2C_ADS.read();
+  return (int16_t)((I2C_ADS.read() << 8) | I2C_ADS.read());
 }
 
-inline void readIMU() __attribute__((always_inline));
-inline void readIMU() {
+static inline void readIMU(int idx) {
   I2C_IMU.beginTransmission(IMU_ADDR);
   I2C_IMU.write(0x32);
   I2C_IMU.endTransmission(false);
   I2C_IMU.requestFrom(IMU_ADDR, (uint8_t)6);
-
   if (I2C_IMU.available() == 6) {
-    uint8_t x0 = I2C_IMU.read(); uint8_t x1 = I2C_IMU.read();
-    uint8_t y0 = I2C_IMU.read(); uint8_t y1 = I2C_IMU.read();
-    uint8_t z0 = I2C_IMU.read(); uint8_t z1 = I2C_IMU.read();
-
-    buffer[batchIndex].accelX = (x1 << 8) | x0;  
-    buffer[batchIndex].accelY = (y1 << 8) | y0;  
-    buffer[batchIndex].accelZ = (z1 << 8) | z0;
+    uint8_t x0 = I2C_IMU.read(), x1 = I2C_IMU.read();
+    uint8_t y0 = I2C_IMU.read(), y1 = I2C_IMU.read();
+    uint8_t z0 = I2C_IMU.read(), z1 = I2C_IMU.read();
+    sampleBuffer[idx].accelX = (int16_t)((x1 << 8) | x0);
+    sampleBuffer[idx].accelY = (int16_t)((y1 << 8) | y0);
+    sampleBuffer[idx].accelZ = (int16_t)((z1 << 8) | z0);
   }
 }
 
-void networkTask(void *pvParameters) {
-  SensorDataPacket sendBuffer[BATCH_SIZE];
-  
-  for (;;) {
-    int packetSize = udp.parsePacket();
-    if (packetSize) {
-      char incoming[20];
-      int len = udp.read(incoming, 20);
-      if (len > 0) incoming[len] = 0;
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BLE callbacks
+// ═══════════════════════════════════════════════════════════════════════════════
 
-      String cmd = String(incoming);  
-      cmd.trim();  
-
-      if (cmd == "START") {  
-        pythonIP = udp.remoteIP();  
-        pythonPort = 5006;  
-        isRunning = true;  
-        Serial.println("Streaming STARTED");  
-      }  
-      else if (cmd == "STOP") {  
-        isRunning = false;  
-        Serial.println("Streaming STOPPED");  
-      }
+class ServerCallbacks : public NimBLEServerCallbacks {
+public:
+    void onConnect(NimBLEServer* pSrv, NimBLEConnInfo& connInfo) override {
+        deviceConnected = true;
+        notifyEnabled   = false;
+        isRunning       = false;
+        Serial.printf("[BLE] Connected\n");
+        pSrv->setDataLen(connInfo.getConnHandle(), 251);
+        NimBLEDevice::setMTU(REQUESTED_MTU);
+        
+        packetCounter = 0;
+        batchIndex = 0;
+        totalSamples = 0;
+        droppedBatches = 0;
+        lastAdvertisingTime = millis();
     }
 
-    if (isRunning) {
-      if (xQueueReceive(dataQueue, &sendBuffer, 10 / portTICK_PERIOD_MS) == pdTRUE) {
-        udp.beginPacket(pythonIP, pythonPort);  
-        udp.write((uint8_t*)&sendBuffer, sizeof(SensorDataPacket) * BATCH_SIZE);  
-        udp.endPacket();
-      }
-    } else {
-      vTaskDelay(10 / portTICK_PERIOD_MS); 
+    void onDisconnect(NimBLEServer* pSrv, NimBLEConnInfo& connInfo,
+                      int reason) override {
+        deviceConnected = false;
+        notifyEnabled   = false;
+        isRunning       = false;
+        Serial.printf("[BLE] Disconnected (reason: %d)\n", reason);
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
+        NimBLEDevice::stopAdvertising();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        startAdvertising();
+        Serial.println("[BLE] Advertising restarted after disconnect");
     }
-  }
+
+    void onMTUChange(uint16_t mtu, NimBLEConnInfo& connInfo) override {
+        Serial.printf("[BLE] MTU = %u bytes (payload = %u bytes)\n", mtu, mtu - 3);
+        if ((mtu - 3) < (sizeof(SensorDataPacket) * BATCH_SIZE)) {
+            Serial.printf("[WARN] MTU too small! Need %d bytes\n",
+                         sizeof(SensorDataPacket) * BATCH_SIZE);
+        }
+    }
+};
+
+class DataCharCallbacks : public NimBLECharacteristicCallbacks {
+public:
+    void onSubscribe(NimBLECharacteristic* pChar,
+                     NimBLEConnInfo& connInfo,
+                     uint16_t subValue) override {
+        if (subValue == 1) {
+            notifyEnabled = true;
+            Serial.println("[BLE] Notifications ENABLED");
+        } else {
+            notifyEnabled = false;
+            isRunning     = false;
+            Serial.println("[BLE] Notifications DISABLED");
+        }
+    }
+};
+
+class CmdCharCallbacks : public NimBLECharacteristicCallbacks {
+public:
+    void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
+        std::string val = pChar->getValue().c_str();
+        while (!val.empty() &&
+               (val.back() == '\r' || val.back() == '\n' || val.back() == ' ')) {
+            val.pop_back();
+        }
+        if (val == "START") {
+            if (deviceConnected && notifyEnabled) {
+                isRunning = true;
+                Serial.println("[CMD] START");
+            } else {
+                Serial.printf("[CMD] START ignored: connected=%d, notify=%d\n",
+                             deviceConnected, notifyEnabled);
+            }
+        } else if (val == "STOP") {
+            isRunning = false;
+            Serial.println("[CMD] STOP");
+        }
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Advertising helper - ✅ CORRECTED for NimBLE v1.4.x
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void startAdvertising() {
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+    
+    // ✅ Stop any existing advertising
+    pAdv->stop();
+    
+    // ✅ Set advertising parameters
+    pAdv->setName(BLE_DEVICE_NAME);
+    pAdv->addServiceUUID(SERVICE_UUID);
+    
+    // ✅ Set scan response data
+    NimBLEAdvertisementData scanResponse;
+    scanResponse.setName(BLE_DEVICE_NAME);
+    pAdv->setScanResponseData(scanResponse);
+    
+    // ✅ Set advertising intervals (faster = more visible)
+    pAdv->setMinInterval(100);  // 100ms
+    pAdv->setMaxInterval(150);  // 150ms
+    
+    // ✅ Start advertising (0 = continuous)
+    pAdv->start(0);
+    
+    Serial.println("[BLE] Advertising started (continuous)");
+    lastAdvertisingTime = millis();
 }
 
-// ================= Setup =================
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BLE task
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void bleTask(void* pvParameters) {
+    (void)pvParameters;
+    SensorDataPacket* batch = nullptr;
+
+    for (;;) {
+        // ✅ Periodic advertising refresh (if not connected)
+        if (!deviceConnected) {
+            unsigned long now = millis();
+            if (now - lastAdvertisingTime > ADVERTISING_RESTART_INTERVAL) {
+                NimBLEDevice::stopAdvertising();
+                vTaskDelay(pdMS_TO_TICKS(50));
+                startAdvertising();
+                Serial.println("[BLE] Advertising refreshed");
+            }
+        }
+
+        if (!isRunning || !deviceConnected || !notifyEnabled) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        if (xQueueReceive(dataQueue, &batch, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (batch == nullptr) continue;
+
+            if (deviceConnected && notifyEnabled && pDataChar != nullptr) {
+                size_t payloadSize = sizeof(SensorDataPacket) * BATCH_SIZE;
+                pDataChar->setValue((uint8_t*)batch, payloadSize);
+                if (!pDataChar->notify()) {
+                    Serial.println("[BLE] notify() failed");
+                }
+            }
+            free(batch);
+            batch = nullptr;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Setup
+// ═══════════════════════════════════════════════════════════════════════════════
+
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
+    Serial.begin(115200);
+    delay(1000);
+    
+    Serial.println("\n[SYS] EEG BLE - Persistent Advertising");
+    Serial.printf("[SYS] Free heap: %d bytes\n", ESP.getFreeHeap());
 
-  I2C_ADS.begin(I2C_ADS_SDA, I2C_ADS_SCL, 800000);  
-  I2C_IMU.begin(I2C_IMU_SDA, I2C_IMU_SCL, 800000);
+    // ── I2C buses ─────────────────────────────────────────────────────────────
+    I2C_ADS.begin(I2C_ADS_SDA, I2C_ADS_SCL, 800000);
+    I2C_IMU.begin(I2C_IMU_SDA, I2C_IMU_SCL, 800000);
+    Serial.println("[SYS] I2C buses initialised");
 
-  // ADXL345 init
-  I2C_IMU.beginTransmission(IMU_ADDR);
-  I2C_IMU.write(0x2D);
-  I2C_IMU.write(0x08);
-  I2C_IMU.endTransmission();
+    // ── ADXL345 init ─────────────────────────────────────────────────────────
+    I2C_IMU.beginTransmission(IMU_ADDR);
+    I2C_IMU.write(0x2D); I2C_IMU.write(0x08);
+    I2C_IMU.endTransmission();
+    I2C_IMU.beginTransmission(IMU_ADDR);
+    I2C_IMU.write(0x31); I2C_IMU.write(0x08);
+    I2C_IMU.endTransmission();
+    Serial.println("[SYS] ADXL345 configured");
 
-  I2C_IMU.beginTransmission(IMU_ADDR);
-  I2C_IMU.write(0x31);
-  I2C_IMU.write(0x08);
-  I2C_IMU.endTransmission();
+    // ── FreeRTOS queue ────────────────────────────────────────────────────────
+    dataQueue = xQueueCreate(8, sizeof(SensorDataPacket*));
+    if (dataQueue == nullptr) {
+        Serial.println("[FATAL] Queue creation failed");
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+    // ── NimBLE ────────────────────────────────────────────────────────────────
+    NimBLEDevice::init(BLE_DEVICE_NAME);
+    NimBLEDevice::setMTU(REQUESTED_MTU);
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+    pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+    NimBLEService* pService = pServer->createService(SERVICE_UUID);
 
-  Serial.println("\nWiFi Connected");
-  Serial.print("ESP32 IP Address: ");
-  Serial.println(WiFi.localIP());
-  esp_wifi_set_ps(WIFI_PS_NONE);  
+    pDataChar = pService->createCharacteristic(DATA_UUID, NIMBLE_PROPERTY::NOTIFY);
+    pDataChar->setCallbacks(new DataCharCallbacks());
+    
+    pCmdChar = pService->createCharacteristic(
+        CMD_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+    );
+    pCmdChar->setCallbacks(new CmdCharCallbacks());
+    pService->start();
 
-  udp.begin(localPort);
-  Serial.println("UDP Ready");
+    // ✅ Start persistent advertising
+    startAdvertising();
 
-  dataQueue = xQueueCreate(10, sizeof(SensorDataPacket) * BATCH_SIZE);
+    Serial.printf("[BLE] Advertising as \"%s\" continuously\n", BLE_DEVICE_NAME);
+    Serial.printf("[SYS] Free heap after BLE init: %d bytes\n", ESP.getFreeHeap());
 
-  xTaskCreatePinnedToCore(
-    networkTask,      
-    "NetworkTask",    
-    4096,             
-    NULL,             
-    1,                
-    NULL,             
-    0                 // Core 0
-  );
+    // ── BLE task ──────────────────────────────────────────────────────────────
+    xTaskCreatePinnedToCore(bleTask, "BLETask", 6144, nullptr, 2, nullptr, 0);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Loop - sensor acquisition
+// ═══════════════════════════════════════════════════════════════════════════════
 
 void loop() {
-  if (isRunning) {
-    unsigned long cycle_start = micros();
+  if (!isRunning) { 
+    vTaskDelay(pdMS_TO_TICKS(10)); 
+    return; 
+  }
 
-    uint16_t config_0_1 = BASE_CONFIG_0_1 | ADS_GAIN;  
+  unsigned long cycle_start = micros();
 
-    writeRegister(ADS1_ADDR, 0x01, config_0_1);
-    writeRegister(ADS2_ADDR, 0x01, config_0_1);
+  // Phase 1: start conversion AIN0 (ch1) and AIN2 (ch3)
+  uint16_t cfg01 = BASE_CONFIG_0_1 | ADS_GAIN;
+  writeADS(ADS1_ADDR, 0x01, cfg01);
+  writeADS(ADS2_ADDR, 0x01, cfg01);
+  delayMicroseconds(1163);
 
-    delayMicroseconds(1163);
+  sampleBuffer[batchIndex].eeg1 = readADS(ADS1_ADDR);
+  sampleBuffer[batchIndex].eeg3 = readADS(ADS2_ADDR);
 
-    buffer[batchIndex].eeg1 = readRegister(ADS1_ADDR, 0x00);  
-    buffer[batchIndex].eeg3 = readRegister(ADS2_ADDR, 0x00);  
+  // Phase 2: start conversion AIN1 (ch2) and AIN3 (ch4)
+  uint16_t cfg23 = BASE_CONFIG_2_3 | ADS_GAIN;
+  writeADS(ADS1_ADDR, 0x01, cfg23);
+  writeADS(ADS2_ADDR, 0x01, cfg23);
 
-    uint16_t config_2_3 = BASE_CONFIG_2_3 | ADS_GAIN;  
-    writeRegister(ADS1_ADDR, 0x01, config_2_3);  
-    writeRegister(ADS2_ADDR, 0x01, config_2_3);
+  // Read IMU during conversion dead-time
+  unsigned long t0 = micros();
+  readIMU(batchIndex);
+  unsigned long imuUs = micros() - t0;
+  if (imuUs < 1163) delayMicroseconds(1163 - imuUs);
 
-    unsigned long t = micros();
-    readIMU();  
-    unsigned long elapsed = micros() - t;
+  sampleBuffer[batchIndex].eeg2 = readADS(ADS1_ADDR);
+  sampleBuffer[batchIndex].eeg4 = readADS(ADS2_ADDR);
 
-    if (elapsed < 1163) {  
-      delayMicroseconds(1163 - elapsed);  
-    }  
+  sampleBuffer[batchIndex].counter    = packetCounter++;
+  sampleBuffer[batchIndex].header     = 0xAA;
+  sampleBuffer[batchIndex].packetType = 0x01;
+  sampleBuffer[batchIndex].footer     = 0x55;
 
-    buffer[batchIndex].eeg2 = readRegister(ADS1_ADDR, 0x00);  
-    buffer[batchIndex].eeg4 = readRegister(ADS2_ADDR, 0x00);  
+  batchIndex++;
 
-    buffer[batchIndex].counter = packetCounter++;  
-    buffer[batchIndex].header = 0xAA;
-    buffer[batchIndex].packetType = 0x01;
-    buffer[batchIndex].footer = 0x55;
-
-    batchIndex++;
-
-    if (batchIndex == BATCH_SIZE) {
-      xQueueSend(dataQueue, &buffer, 0); 
-      batchIndex = 0;
+  if (batchIndex == BATCH_SIZE) {
+    SensorDataPacket* copy = (SensorDataPacket*)heap_caps_malloc(
+        sizeof(SensorDataPacket) * BATCH_SIZE, 
+        MALLOC_CAP_DEFAULT
+    );
+    if (copy != nullptr) {
+      memcpy(copy, sampleBuffer, sizeof(SensorDataPacket) * BATCH_SIZE);
+      if (xQueueSend(dataQueue, &copy, 0) != pdTRUE) {
+        free(copy);
+        droppedBatches++;
+      }
+    } else {
+      droppedBatches++;
     }
+    batchIndex = 0;
+  }
 
-    static uint32_t count = 0;
-    static unsigned long total_cycle_time = 0;
-    static unsigned long last_time = millis();
-    
-    count++;   
-    total_cycle_time += (micros() - cycle_start);
-    
-    if (millis() - last_time >= 1000) {
-      Serial.print("Rate: ");
-      Serial.print(count);  // Hz
-      Serial.print(" Avg cycle us: ");
-      Serial.println(total_cycle_time / count);
-      
-      count = 0;
-      total_cycle_time = 0;
-      last_time = millis();
-    }
-  } else {
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+  totalSamples++;
+
+  // ── Rate monitor ────────────────────────────────────────────────────────────
+  static uint32_t count = 0;
+  static unsigned long totalUs = 0, lastMs = 0;
+  count++;
+  totalUs += (micros() - cycle_start);
+  if (millis() - lastMs >= 1000) {
+    Serial.printf("Rate: %u Hz | Avg: %lu µs | Queue: %d/8 | Dropped: %u | Heap: %d\n", 
+                  count, totalUs / count, 
+                  (int)uxQueueMessagesWaiting(dataQueue),
+                  droppedBatches,
+                  ESP.getFreeHeap());
+    count = 0; totalUs = 0; lastMs = millis();
   }
 }
