@@ -81,7 +81,7 @@ FS_HZ = 257.1                           # Hz  ← measure and set this precisely
 # (range -32768..+32767, i.e. 2^15 steps per side) -- the correct value for
 # ±0.512V is 15.625 µV/LSB, as used below and as this firmware is actually
 # configured. Fix the manuscript number, not this one.
-TOTAL_PREAMP_GAIN = 902.0          # INA333 (x2) x OPA2349 stage A (x11) x stage B (x41)
+TOTAL_PREAMP_GAIN = 1353.0          # INA333 (x3) x OPA2349 stage A (x11) x stage B (x41)
 
 ADS_GAIN_RANGE_V = 0.512
 ADS_BITS         = 16
